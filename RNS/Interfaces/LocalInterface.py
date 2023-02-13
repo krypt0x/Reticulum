@@ -1,3 +1,25 @@
+# MIT License
+#
+# Copyright (c) 2016-2022 Mark Qvist / unsigned.io
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 from .Interface import Interface
 import socketserver
 import threading
@@ -27,6 +49,12 @@ class LocalClientInterface(Interface):
     def __init__(self, owner, name, target_port = None, connected_socket=None):
         self.rxb = 0
         self.txb = 0
+
+        # TODO: Remove at some point
+        # self.rxptime = 0
+        
+        self.HW_MTU = 1064
+
         self.online  = False
         
         self.IN               = True
@@ -37,6 +65,7 @@ class LocalClientInterface(Interface):
         self.never_connected  = True
         self.detached         = False
         self.name             = name
+        self.mode             = RNS.Interfaces.Interface.Interface.MODE_FULL
 
         if connected_socket != None:
             self.receives    = True
@@ -53,12 +82,17 @@ class LocalClientInterface(Interface):
             self.connect()
 
         self.owner   = owner
+        self.bitrate = 1000*1000*1000
         self.online  = True
         self.writing = False
 
+        self.announce_rate_target  = None
+        self.announce_rate_grace   = None
+        self.announce_rate_penalty = None
+
         if connected_socket == None:
             thread = threading.Thread(target=self.read_loop)
-            thread.setDaemon(True)
+            thread.daemon = True
             thread.start()
 
     def connect(self):
@@ -89,11 +123,11 @@ class LocalClientInterface(Interface):
                         RNS.log("Connection attempt for "+str(self)+" failed: "+str(e), RNS.LOG_DEBUG)
 
                 if not self.never_connected:
-                    RNS.log("Reconnected TCP socket for "+str(self)+".", RNS.LOG_INFO)
+                    RNS.log("Reconnected socket for "+str(self)+".", RNS.LOG_INFO)
 
                 self.reconnecting = False
                 thread = threading.Thread(target=self.read_loop)
-                thread.setDaemon(True)
+                thread.daemon = True
                 thread.start()
                 RNS.Transport.shared_connection_reappeared()
         
@@ -106,15 +140,18 @@ class LocalClientInterface(Interface):
         self.rxb += len(data)
         if hasattr(self, "parent_interface") and self.parent_interface != None:
             self.parent_interface.rxb += len(data)
-            
+        
+        # TODO: Remove at some point
+        # processing_start = time.time()
+        
         self.owner.inbound(data, self)
 
+        # TODO: Remove at some point
+        # duration = time.time() - processing_start
+        # self.rxptime += duration
 
     def processOutgoing(self, data):
         if self.online:
-            while self.writing:
-                time.sleep(0.01)
-
             try:
                 self.writing = True
                 data = bytes([HDLC.FLAG])+HDLC.escape(data)+bytes([HDLC.FLAG])
@@ -149,7 +186,7 @@ class LocalClientInterface(Interface):
                         elif (byte == HDLC.FLAG):
                             in_frame = True
                             data_buffer = b""
-                        elif (in_frame and len(data_buffer) < RNS.Reticulum.MTU):
+                        elif (in_frame and len(data_buffer) < self.HW_MTU):
                             if (byte == HDLC.ESC):
                                 escape = True
                             else:
@@ -209,6 +246,7 @@ class LocalClientInterface(Interface):
             RNS.Transport.local_client_interfaces.remove(self)
             if hasattr(self, "parent_interface") and self.parent_interface != None:
                 self.parent_interface.clients -= 1
+                RNS.Transport.owner._should_persist_data()
 
         if nowarning == False:
             RNS.log("The interface "+str(self)+" experienced an unrecoverable error and is being torn down. Restart Reticulum to attempt to open this interface again.", RNS.LOG_ERROR)
@@ -237,6 +275,7 @@ class LocalServerInterface(Interface):
         self.IN  = True
         self.OUT = False
         self.name = "Reticulum"
+        self.mode = RNS.Interfaces.Interface.Interface.MODE_FULL
 
         if (bindport != None):
             self.receives = True
@@ -257,9 +296,14 @@ class LocalServerInterface(Interface):
             self.server = ThreadingTCPServer(address, handlerFactory(self.incoming_connection))
 
             thread = threading.Thread(target=self.server.serve_forever)
-            thread.setDaemon(True)
+            thread.daemon = True
             thread.start()
 
+            self.announce_rate_target  = None
+            self.announce_rate_grace   = None
+            self.announce_rate_penalty = None
+
+            self.bitrate = 1000*1000*1000
             self.online = True
 
 
@@ -272,7 +316,8 @@ class LocalServerInterface(Interface):
         spawned_interface.target_ip = handler.client_address[0]
         spawned_interface.target_port = str(handler.client_address[1])
         spawned_interface.parent_interface = self
-        RNS.log("Accepting new connection to shared instance: "+str(spawned_interface), RNS.LOG_VERBOSE)
+        spawned_interface.bitrate = self.bitrate
+        RNS.log("Accepting new connection to shared instance: "+str(spawned_interface), RNS.LOG_EXTREME)
         RNS.Transport.interfaces.append(spawned_interface)
         RNS.Transport.local_client_interfaces.append(spawned_interface)
         self.clients += 1

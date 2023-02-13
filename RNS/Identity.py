@@ -1,18 +1,37 @@
-import base64
+# MIT License
+#
+# Copyright (c) 2016-2022 Mark Qvist / unsigned.io
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 import math
 import os
 import RNS
 import time
 import atexit
-import base64
+import hashlib
+
 from .vendor import umsgpack as umsgpack
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.fernet import Fernet
+
+from RNS.Cryptography import X25519PrivateKey, X25519PublicKey, Ed25519PrivateKey, Ed25519PublicKey
+from RNS.Cryptography import Fernet
+
 
 class Identity:
     """
@@ -34,12 +53,12 @@ class Identity:
     """   
 
     # Non-configurable constants
-    FERNET_VERSION   = 0x80
-    FERNET_OVERHEAD  = 54     # In bytes
-    AES128_BLOCKSIZE = 16     # In bytes
-    HASHLENGTH  = 256         # In bits
-    SIGLENGTH   = KEYSIZE     # In bits
+    FERNET_OVERHEAD           = RNS.Cryptography.Fernet.FERNET_OVERHEAD
+    AES128_BLOCKSIZE          = 16          # In bytes
+    HASHLENGTH                = 256         # In bits
+    SIGLENGTH                 = KEYSIZE     # In bits
 
+    NAME_HASH_LENGTH     = 80
     TRUNCATED_HASHLENGTH = RNS.Reticulum.TRUNCATED_HASHLENGTH
     """
     Constant specifying the truncated hash length (in bits) used by Reticulum
@@ -72,6 +91,13 @@ class Identity:
             identity.app_data = identity_data[3]
             return identity
         else:
+            for registered_destination in RNS.Transport.destinations:
+                if destination_hash == registered_destination.hash:
+                    identity = Identity(create_keys=False)
+                    identity.load_public_key(registered_destination.identity.get_public_key())
+                    identity.app_data = None
+                    return identity
+
             return None
 
     @staticmethod
@@ -90,7 +116,26 @@ class Identity:
 
     @staticmethod
     def save_known_destinations():
+        # TODO: Improve the storage method so we don't have to
+        # deserialize and serialize the entire table on every
+        # save, but the only changes. It might be possible to
+        # simply overwrite on exit now that every local client
+        # disconnect triggers a data persist.
+        
         try:
+            if hasattr(Identity, "saving_known_destinations"):
+                wait_interval = 0.2
+                wait_timeout = 5
+                wait_start = time.time()
+                while Identity.saving_known_destinations:
+                    time.sleep(wait_interval)
+                    if time.time() > wait_start+wait_timeout:
+                        RNS.log("Could not save known destinations to storage, waiting for previous save operation timed out.", RNS.LOG_ERROR)
+                        return False
+
+            Identity.saving_known_destinations = True
+            save_start = time.time()
+
             storage_known_destinations = {}
             if os.path.isfile(RNS.Reticulum.storagepath+"/known_destinations"):
                 try:
@@ -104,21 +149,37 @@ class Identity:
                 if not destination_hash in Identity.known_destinations:
                     Identity.known_destinations[destination_hash] = storage_known_destinations[destination_hash]
 
-            RNS.log("Saving known destinations to storage...", RNS.LOG_VERBOSE)
+            RNS.log("Saving "+str(len(Identity.known_destinations))+" known destinations to storage...", RNS.LOG_DEBUG)
             file = open(RNS.Reticulum.storagepath+"/known_destinations","wb")
             umsgpack.dump(Identity.known_destinations, file)
             file.close()
-            RNS.log("Done saving known destinations to storage", RNS.LOG_VERBOSE)
+
+            save_time = time.time() - save_start
+            if save_time < 1:
+                time_str = str(round(save_time*1000,2))+"ms"
+            else:
+                time_str = str(round(save_time,2))+"s"
+
+            RNS.log("Saved known destinations to storage in "+time_str, RNS.LOG_DEBUG)
+
         except Exception as e:
             RNS.log("Error while saving known destinations to disk, the contained exception was: "+str(e), RNS.LOG_ERROR)
+
+        Identity.saving_known_destinations = False
 
     @staticmethod
     def load_known_destinations():
         if os.path.isfile(RNS.Reticulum.storagepath+"/known_destinations"):
             try:
                 file = open(RNS.Reticulum.storagepath+"/known_destinations","rb")
-                Identity.known_destinations = umsgpack.load(file)
+                loaded_known_destinations = umsgpack.load(file)
                 file.close()
+
+                Identity.known_destinations = {}
+                for known_destination in loaded_known_destinations:
+                    if len(known_destination) == RNS.Reticulum.TRUNCATED_HASHLENGTH//8:
+                        Identity.known_destinations[known_destination] = loaded_known_destinations[known_destination]
+
                 RNS.log("Loaded "+str(len(Identity.known_destinations))+" known destination from storage", RNS.LOG_VERBOSE)
             except:
                 RNS.log("Error loading known destinations from disk, file will be recreated on exit", RNS.LOG_ERROR)
@@ -133,10 +194,7 @@ class Identity:
         :param data: Data to be hashed as *bytes*.
         :returns: SHA-256 hash as *bytes*
         """
-        digest = hashes.Hash(hashes.SHA256(), backend=default_backend())
-        digest.update(data)
-
-        return digest.finalize()
+        return RNS.Cryptography.sha256(data)
 
     @staticmethod
     def truncated_hash(data):
@@ -156,41 +214,87 @@ class Identity:
         :param data: Data to be hashed as *bytes*.
         :returns: Truncated SHA-256 hash of random data as *bytes*
         """
-        return Identity.truncated_hash(os.urandom(10))
+        return Identity.truncated_hash(os.urandom(Identity.TRUNCATED_HASHLENGTH//8))
 
     @staticmethod
     def validate_announce(packet):
-        if packet.packet_type == RNS.Packet.ANNOUNCE:
-            RNS.log("Validating announce from "+RNS.prettyhexrep(packet.destination_hash), RNS.LOG_DEBUG)
-            destination_hash = packet.destination_hash
-            public_key = packet.data[:Identity.KEYSIZE//8]
-            random_hash = packet.data[Identity.KEYSIZE//8:Identity.KEYSIZE//8+10]
-            signature = packet.data[Identity.KEYSIZE//8+10:Identity.KEYSIZE//8+10+Identity.KEYSIZE//8]
-            app_data = b""
-            if len(packet.data) > Identity.KEYSIZE//8+10+Identity.KEYSIZE//8:
-                app_data = packet.data[Identity.KEYSIZE//8+10+Identity.KEYSIZE//8:]
+        try:
+            if packet.packet_type == RNS.Packet.ANNOUNCE:
+                destination_hash = packet.destination_hash
+                public_key = packet.data[:Identity.KEYSIZE//8]
+                name_hash = packet.data[Identity.KEYSIZE//8:Identity.KEYSIZE//8+Identity.NAME_HASH_LENGTH//8]
+                random_hash = packet.data[Identity.KEYSIZE//8+Identity.NAME_HASH_LENGTH//8:Identity.KEYSIZE//8+Identity.NAME_HASH_LENGTH//8+10]
+                signature = packet.data[Identity.KEYSIZE//8+Identity.NAME_HASH_LENGTH//8+10:Identity.KEYSIZE//8+Identity.NAME_HASH_LENGTH//8+10+Identity.SIGLENGTH//8]
+                app_data = b""
+                if len(packet.data) > Identity.KEYSIZE//8+Identity.NAME_HASH_LENGTH//8+10+Identity.SIGLENGTH//8:
+                    app_data = packet.data[Identity.KEYSIZE//8+Identity.NAME_HASH_LENGTH//8+10+Identity.SIGLENGTH//8:]
 
-            signed_data = destination_hash+public_key+random_hash+app_data
+                signed_data = destination_hash+public_key+name_hash+random_hash+app_data
 
-            if not len(packet.data) > Identity.KEYSIZE//8+10+Identity.KEYSIZE//8:
-                app_data = None
+                if not len(packet.data) > Identity.KEYSIZE//8+Identity.NAME_HASH_LENGTH//8+10+Identity.SIGLENGTH//8:
+                    app_data = None
 
-            announced_identity = Identity(create_keys=False)
-            announced_identity.load_public_key(public_key)
+                announced_identity = Identity(create_keys=False)
+                announced_identity.load_public_key(public_key)
 
-            if announced_identity.pub != None and announced_identity.validate(signature, signed_data):
-                RNS.Identity.remember(packet.get_hash(), destination_hash, public_key, app_data)
-                RNS.log("Stored valid announce from "+RNS.prettyhexrep(destination_hash), RNS.LOG_DEBUG)
-                del announced_identity
-                return True
-            else:
-                RNS.log("Received invalid announce", RNS.LOG_DEBUG)
-                del announced_identity
-                return False
+                if announced_identity.pub != None and announced_identity.validate(signature, signed_data):
+                    hash_material = name_hash+announced_identity.hash
+                    expected_hash = RNS.Identity.full_hash(hash_material)[:RNS.Reticulum.TRUNCATED_HASHLENGTH//8]
+
+                    if destination_hash == expected_hash:
+                        # Check if we already have a public key for this destination
+                        # and make sure the public key is not different.
+                        if destination_hash in Identity.known_destinations:
+                            if public_key != Identity.known_destinations[destination_hash][2]:
+                                # In reality, this should never occur, but in the odd case
+                                # that someone manages a hash collision, we reject the announce.
+                                RNS.log("Received announce with valid signature and destination hash, but announced public key does not match already known public key.", RNS.LOG_CRITICAL)
+                                RNS.log("This may indicate an attempt to modify network paths, or a random hash collision. The announce was rejected.", RNS.LOG_CRITICAL)
+                                return False
+
+                        RNS.Identity.remember(packet.get_hash(), destination_hash, public_key, app_data)
+                        del announced_identity
+
+                        if packet.rssi != None or packet.snr != None:
+                            signal_str = " ["
+                            if packet.rssi != None:
+                                signal_str += "RSSI "+str(packet.rssi)+"dBm"
+                                if packet.snr != None:
+                                    signal_str += ", "
+                            if packet.snr != None:
+                                signal_str += "SNR "+str(packet.snr)+"dB"
+                            signal_str += "]"
+                        else:
+                            signal_str = ""
+
+                        if hasattr(packet, "transport_id") and packet.transport_id != None:
+                            RNS.log("Valid announce for "+RNS.prettyhexrep(destination_hash)+" "+str(packet.hops)+" hops away, received via "+RNS.prettyhexrep(packet.transport_id)+" on "+str(packet.receiving_interface)+signal_str, RNS.LOG_EXTREME)
+                        else:
+                            RNS.log("Valid announce for "+RNS.prettyhexrep(destination_hash)+" "+str(packet.hops)+" hops away, received on "+str(packet.receiving_interface)+signal_str, RNS.LOG_EXTREME)
+
+                        return True
+
+                    else:
+                        RNS.log("Received invalid announce for "+RNS.prettyhexrep(destination_hash)+": Destination mismatch.", RNS.LOG_DEBUG)
+                        return False
+
+                else:
+                    RNS.log("Received invalid announce for "+RNS.prettyhexrep(destination_hash)+": Invalid signature.", RNS.LOG_DEBUG)
+                    del announced_identity
+                    return False
+        
+        except Exception as e:
+            RNS.log("Error occurred while validating announce. The contained exception was: "+str(e), RNS.LOG_ERROR)
+            return False
+
+    @staticmethod
+    def persist_data():
+        if not RNS.Transport.owner.is_connected_to_shared_instance:
+            Identity.save_known_destinations()
 
     @staticmethod
     def exit_handler():
-        Identity.save_known_destinations()
+        Identity.persist_data()
 
 
     @staticmethod
@@ -262,30 +366,16 @@ class Identity:
 
     def create_keys(self):
         self.prv           = X25519PrivateKey.generate()
-        self.prv_bytes     = self.prv.private_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PrivateFormat.Raw,
-            encryption_algorithm=serialization.NoEncryption()
-        )
+        self.prv_bytes     = self.prv.private_bytes()
 
         self.sig_prv       = Ed25519PrivateKey.generate()
-        self.sig_prv_bytes = self.sig_prv.private_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PrivateFormat.Raw,
-            encryption_algorithm=serialization.NoEncryption()
-        )
+        self.sig_prv_bytes = self.sig_prv.private_bytes()
 
         self.pub           = self.prv.public_key()
-        self.pub_bytes     = self.pub.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw
-        )
+        self.pub_bytes     = self.pub.public_bytes()
 
         self.sig_pub       = self.sig_prv.public_key()
-        self.sig_pub_bytes = self.sig_pub.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw
-        )
+        self.sig_pub_bytes = self.sig_pub.public_bytes()
 
         self.update_hashes()
 
@@ -317,16 +407,10 @@ class Identity:
             self.sig_prv       = Ed25519PrivateKey.from_private_bytes(self.sig_prv_bytes)
             
             self.pub           = self.prv.public_key()
-            self.pub_bytes     = self.pub.public_bytes(
-                encoding=serialization.Encoding.Raw,
-                format=serialization.PublicFormat.Raw
-            )
+            self.pub_bytes     = self.pub.public_bytes()
 
             self.sig_pub       = self.sig_prv.public_key()
-            self.sig_pub_bytes = self.sig_pub.public_bytes(
-                encoding=serialization.Encoding.Raw,
-                format=serialization.PublicFormat.Raw
-            )
+            self.sig_pub_bytes = self.sig_pub.public_bytes()
 
             self.update_hashes()
 
@@ -386,21 +470,19 @@ class Identity:
         """
         if self.pub != None:
             ephemeral_key = X25519PrivateKey.generate()
-            ephemeral_pub_bytes = ephemeral_key.public_key().public_bytes(
-                encoding=serialization.Encoding.Raw,
-                format=serialization.PublicFormat.Raw
-            )
+            ephemeral_pub_bytes = ephemeral_key.public_key().public_bytes()
 
             shared_key = ephemeral_key.exchange(self.pub)
-            derived_key = derived_key = HKDF(
-                algorithm=hashes.SHA256(),
+            
+            derived_key = RNS.Cryptography.hkdf(
                 length=32,
+                derive_from=shared_key,
                 salt=self.get_salt(),
-                info=self.get_context(),
-            ).derive(shared_key)
+                context=self.get_context(),
+            )
 
-            fernet = Fernet(base64.urlsafe_b64encode(derived_key))
-            ciphertext = base64.urlsafe_b64decode(fernet.encrypt(plaintext))
+            fernet = Fernet(derived_key)
+            ciphertext = fernet.encrypt(plaintext)
             token = ephemeral_pub_bytes+ciphertext
 
             return token
@@ -424,16 +506,17 @@ class Identity:
                     peer_pub = X25519PublicKey.from_public_bytes(peer_pub_bytes)
 
                     shared_key = self.prv.exchange(peer_pub)
-                    derived_key = derived_key = HKDF(
-                        algorithm=hashes.SHA256(),
-                        length=32,
-                        salt=self.get_salt(),
-                        info=self.get_context(),
-                    ).derive(shared_key)
 
-                    fernet = Fernet(base64.urlsafe_b64encode(derived_key))
+                    derived_key = RNS.Cryptography.hkdf(
+                        length=32,
+                        derive_from=shared_key,
+                        salt=self.get_salt(),
+                        context=self.get_context(),
+                    )
+
+                    fernet = Fernet(derived_key)
                     ciphertext = ciphertext_token[Identity.KEYSIZE//8//2:]
-                    plaintext = fernet.decrypt(base64.urlsafe_b64encode(ciphertext))
+                    plaintext = fernet.decrypt(ciphertext)
 
                 except Exception as e:
                     RNS.log("Decryption by "+RNS.prettyhexrep(self.hash)+" failed: "+str(e), RNS.LOG_DEBUG)
@@ -459,7 +542,7 @@ class Identity:
                 return self.sig_prv.sign(message)    
             except Exception as e:
                 RNS.log("The identity "+str(self)+" could not sign the requested message. The contained exception was: "+str(e), RNS.LOG_ERROR)
-                raise e 
+                raise e
         else:
             raise KeyError("Signing failed because identity does not hold a private key")
 

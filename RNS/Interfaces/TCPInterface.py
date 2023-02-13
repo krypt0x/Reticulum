@@ -1,3 +1,25 @@
+# MIT License
+#
+# Copyright (c) 2016-2022 Mark Qvist / unsigned.io
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 from .Interface import Interface
 import socketserver
 import threading
@@ -37,18 +59,30 @@ class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     pass
 
 class TCPClientInterface(Interface):
+    BITRATE_GUESS = 10*1000*1000
+
     RECONNECT_WAIT = 5
     RECONNECT_MAX_TRIES = None
 
     # TCP socket options
-    TCP_USER_TIMEOUT = 20
+    TCP_USER_TIMEOUT = 24
     TCP_PROBE_AFTER = 5
-    TCP_PROBE_INTERVAL = 3
-    TCP_PROBES = 5
+    TCP_PROBE_INTERVAL = 2
+    TCP_PROBES = 12
 
-    def __init__(self, owner, name, target_ip=None, target_port=None, connected_socket=None, max_reconnect_tries=None, kiss_framing=False):
+    INITIAL_CONNECT_TIMEOUT = 5
+    SYNCHRONOUS_START = True
+
+    I2P_USER_TIMEOUT = 45
+    I2P_PROBE_AFTER = 10
+    I2P_PROBE_INTERVAL = 9
+    I2P_PROBES = 5
+
+    def __init__(self, owner, name, target_ip=None, target_port=None, connected_socket=None, max_reconnect_tries=None, kiss_framing=False, i2p_tunneled = False, connect_timeout = None):
         self.rxb = 0
         self.txb = 0
+        
+        self.HW_MTU = 1064
         
         self.IN               = True
         self.OUT              = False
@@ -63,7 +97,10 @@ class TCPClientInterface(Interface):
         self.online           = False
         self.detached         = False
         self.kiss_framing     = kiss_framing
-
+        self.i2p_tunneled     = i2p_tunneled
+        self.mode             = RNS.Interfaces.Interface.Interface.MODE_FULL
+        self.bitrate          = TCPClientInterface.BITRATE_GUESS
+        
         if max_reconnect_tries == None:
             self.max_reconnect_tries = TCPClientInterface.RECONNECT_MAX_TRIES
         else:
@@ -85,26 +122,45 @@ class TCPClientInterface(Interface):
             self.target_ip   = target_ip
             self.target_port = target_port
             self.initiator   = True
-            
-            if not self.connect(initial=True):
-                thread = threading.Thread(target=self.reconnect)
-                thread.setDaemon(True)
-                thread.start()
-            else:
-                thread = threading.Thread(target=self.read_loop)
-                thread.setDaemon(True)
-                thread.start()
-                if not self.kiss_framing:
-                    self.wants_tunnel = True
 
+            if connect_timeout != None:
+                self.connect_timeout = connect_timeout
+            else:
+                self.connect_timeout = TCPClientInterface.INITIAL_CONNECT_TIMEOUT
+            
+            if TCPClientInterface.SYNCHRONOUS_START:
+                self.initial_connect()
+            else:
+                thread = threading.Thread(target=self.initial_connect)
+                thread.daemon = True
+                thread.start()
+            
+    def initial_connect(self):
+        if not self.connect(initial=True):
+            thread = threading.Thread(target=self.reconnect)
+            thread.daemon = True
+            thread.start()
+        else:
+            thread = threading.Thread(target=self.read_loop)
+            thread.daemon = True
+            thread.start()
+            if not self.kiss_framing:
+                self.wants_tunnel = True
 
     def set_timeouts_linux(self):
-        self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, int(TCPClientInterface.TCP_USER_TIMEOUT * 1000))
+        if not self.i2p_tunneled:
+            self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, int(TCPClientInterface.TCP_USER_TIMEOUT * 1000))
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, int(TCPClientInterface.TCP_PROBE_AFTER))
+            self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, int(TCPClientInterface.TCP_PROBE_INTERVAL))
+            self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, int(TCPClientInterface.TCP_PROBES))
 
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, int(TCPClientInterface.TCP_PROBE_AFTER))
-        self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, int(TCPClientInterface.TCP_PROBE_INTERVAL))
-        self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, int(TCPClientInterface.TCP_PROBES))
+        else:
+            self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, int(TCPClientInterface.I2P_USER_TIMEOUT * 1000))
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, int(TCPClientInterface.I2P_PROBE_AFTER))
+            self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, int(TCPClientInterface.I2P_PROBE_INTERVAL))
+            self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, int(TCPClientInterface.I2P_PROBES))
 
     def set_timeouts_osx(self):
         if hasattr(socket, "TCP_KEEPALIVE"):
@@ -112,9 +168,13 @@ class TCPClientInterface(Interface):
         else:
             TCP_KEEPIDLE = 0x10
 
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        sock.setsockopt(socket.IPPROTO_TCP, TCP_KEEPIDLE, int(TCPClientInterface.TCP_PROBE_AFTER))
-
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        
+        if not self.i2p_tunneled:
+            self.socket.setsockopt(socket.IPPROTO_TCP, TCP_KEEPIDLE, int(TCPClientInterface.TCP_PROBE_AFTER))
+        else:
+            self.socket.setsockopt(socket.IPPROTO_TCP, TCP_KEEPIDLE, int(TCPClientInterface.I2P_PROBE_AFTER))
+        
     def detach(self):
         if self.socket != None:
             if hasattr(self.socket, "close"):
@@ -136,9 +196,17 @@ class TCPClientInterface(Interface):
 
     def connect(self, initial=False):
         try:
+            if initial:
+                RNS.log("Establishing TCP connection for "+str(self)+"...", RNS.LOG_DEBUG)
+
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.settimeout(TCPClientInterface.INITIAL_CONNECT_TIMEOUT)
             self.socket.connect((self.target_ip, self.target_port))
+            self.socket.settimeout(None)
             self.online  = True
+
+            if initial:
+                RNS.log("TCP connection for "+str(self)+" established", RNS.LOG_DEBUG)
         
         except Exception as e:
             if initial:
@@ -182,11 +250,11 @@ class TCPClientInterface(Interface):
                         RNS.log("Connection attempt for "+str(self)+" failed: "+str(e), RNS.LOG_DEBUG)
 
                 if not self.never_connected:
-                    RNS.log("Reconnected TCP socket for "+str(self)+".", RNS.LOG_INFO)
+                    RNS.log("Reconnected socket for "+str(self)+".", RNS.LOG_INFO)
 
                 self.reconnecting = False
                 thread = threading.Thread(target=self.read_loop)
-                thread.setDaemon(True)
+                thread.daemon = True
                 thread.start()
                 if not self.kiss_framing:
                     RNS.Transport.synthesize_tunnel(self)
@@ -204,8 +272,8 @@ class TCPClientInterface(Interface):
 
     def processOutgoing(self, data):
         if self.online:
-            while self.writing:
-                time.sleep(0.01)
+            # while self.writing:
+            #     time.sleep(0.01)
 
             try:
                 self.writing = True
@@ -251,7 +319,7 @@ class TCPClientInterface(Interface):
                                 in_frame = True
                                 command = KISS.CMD_UNKNOWN
                                 data_buffer = b""
-                            elif (in_frame and len(data_buffer) < RNS.Reticulum.MTU):
+                            elif (in_frame and len(data_buffer) < self.HW_MTU):
                                 if (len(data_buffer) == 0 and command == KISS.CMD_UNKNOWN):
                                     # We only support one HDLC port for now, so
                                     # strip off the port nibble
@@ -277,7 +345,7 @@ class TCPClientInterface(Interface):
                             elif (byte == HDLC.FLAG):
                                 in_frame = True
                                 data_buffer = b""
-                            elif (in_frame and len(data_buffer) < RNS.Reticulum.MTU):
+                            elif (in_frame and len(data_buffer) < self.HW_MTU):
                                 if (byte == HDLC.ESC):
                                     escape = True
                                 else:
@@ -291,10 +359,10 @@ class TCPClientInterface(Interface):
                 else:
                     self.online = False
                     if self.initiator and not self.detached:
-                        RNS.log("TCP socket for "+str(self)+" was closed, attempting to reconnect...", RNS.LOG_WARNING)
+                        RNS.log("The socket for "+str(self)+" was closed, attempting to reconnect...", RNS.LOG_WARNING)
                         self.reconnect()
                     else:
-                        RNS.log("TCP socket for remote client "+str(self)+" was closed.", RNS.LOG_VERBOSE)
+                        RNS.log("The socket for remote client "+str(self)+" was closed.", RNS.LOG_VERBOSE)
                         self.teardown()
 
                     break
@@ -336,6 +404,8 @@ class TCPClientInterface(Interface):
 
 
 class TCPServerInterface(Interface):
+    BITRATE_GUESS      = 10*1000*1000
+
     @staticmethod
     def get_address_for_if(name):
         import importlib
@@ -358,15 +428,22 @@ class TCPServerInterface(Interface):
             RNS.log("You can install it with the command: python3 -m pip install netifaces", RNS.LOG_CRITICAL)
             RNS.panic()
 
-    def __init__(self, owner, name, device=None, bindip=None, bindport=None):
+    def __init__(self, owner, name, device=None, bindip=None, bindport=None, i2p_tunneled=False):
         self.rxb = 0
         self.txb = 0
+
+        self.HW_MTU = 1064
+
         self.online = False
         self.clients = 0
         
         self.IN  = True
         self.OUT = False
         self.name = name
+        self.detached = False
+
+        self.i2p_tunneled = i2p_tunneled
+        self.mode         = RNS.Interfaces.Interface.Interface.MODE_FULL
 
         if device != None:
             bindip = TCPServerInterface.get_address_for_if(device)
@@ -387,8 +464,10 @@ class TCPServerInterface(Interface):
             ThreadingTCPServer.allow_reuse_address = True
             self.server = ThreadingTCPServer(address, handlerFactory(self.incoming_connection))
 
+            self.bitrate = TCPServerInterface.BITRATE_GUESS
+
             thread = threading.Thread(target=self.server.serve_forever)
-            thread.setDaemon(True)
+            thread.daemon = True
             thread.start()
 
             self.online = True
@@ -397,12 +476,39 @@ class TCPServerInterface(Interface):
     def incoming_connection(self, handler):
         RNS.log("Accepting incoming TCP connection", RNS.LOG_VERBOSE)
         interface_name = "Client on "+self.name
-        spawned_interface = TCPClientInterface(self.owner, interface_name, target_ip=None, target_port=None, connected_socket=handler.request)
+        spawned_interface = TCPClientInterface(self.owner, interface_name, target_ip=None, target_port=None, connected_socket=handler.request, i2p_tunneled=self.i2p_tunneled)
         spawned_interface.OUT = self.OUT
         spawned_interface.IN  = self.IN
         spawned_interface.target_ip = handler.client_address[0]
         spawned_interface.target_port = str(handler.client_address[1])
         spawned_interface.parent_interface = self
+        spawned_interface.bitrate = self.bitrate
+        
+        spawned_interface.ifac_size = self.ifac_size
+        spawned_interface.ifac_netname = self.ifac_netname
+        spawned_interface.ifac_netkey = self.ifac_netkey
+        if spawned_interface.ifac_netname != None or spawned_interface.ifac_netkey != None:
+            ifac_origin = b""
+            if spawned_interface.ifac_netname != None:
+                ifac_origin += RNS.Identity.full_hash(spawned_interface.ifac_netname.encode("utf-8"))
+            if spawned_interface.ifac_netkey != None:
+                ifac_origin += RNS.Identity.full_hash(spawned_interface.ifac_netkey.encode("utf-8"))
+
+            ifac_origin_hash = RNS.Identity.full_hash(ifac_origin)
+            spawned_interface.ifac_key = RNS.Cryptography.hkdf(
+                length=64,
+                derive_from=ifac_origin_hash,
+                salt=RNS.Reticulum.IFAC_SALT,
+                context=None
+            )
+            spawned_interface.ifac_identity = RNS.Identity.from_bytes(spawned_interface.ifac_key)
+            spawned_interface.ifac_signature = spawned_interface.ifac_identity.sign(RNS.Identity.full_hash(spawned_interface.ifac_key))
+
+        spawned_interface.announce_rate_target = self.announce_rate_target
+        spawned_interface.announce_rate_grace = self.announce_rate_grace
+        spawned_interface.announce_rate_penalty = self.announce_rate_penalty
+        spawned_interface.mode = self.mode
+        spawned_interface.HW_MTU = self.HW_MTU
         spawned_interface.online = True
         RNS.log("Spawned new TCPClient Interface: "+str(spawned_interface), RNS.LOG_VERBOSE)
         RNS.Transport.interfaces.append(spawned_interface)
@@ -412,8 +518,24 @@ class TCPServerInterface(Interface):
     def processOutgoing(self, data):
         pass
 
+
+    def detach(self):
+        if self.server != None:
+            if hasattr(self.server, "shutdown"):
+                if callable(self.server.shutdown):
+                    try:
+                        RNS.log("Detaching "+str(self), RNS.LOG_DEBUG)
+                        self.server.shutdown()
+                        self.detached = True
+                        self.server = None
+
+                    except Exception as e:
+                        RNS.log("Error while shutting down server for "+str(self)+": "+str(e))
+
+
     def __str__(self):
         return "TCPServerInterface["+self.name+"/"+self.bind_ip+":"+str(self.bind_port)+"]"
+
 
 class TCPInterfaceHandler(socketserver.BaseRequestHandler):
     def __init__(self, callback, *args, **keys):

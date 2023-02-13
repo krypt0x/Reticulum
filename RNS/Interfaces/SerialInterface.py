@@ -1,3 +1,25 @@
+# MIT License
+#
+# Copyright (c) 2016-2022 Mark Qvist / unsigned.io
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 from .Interface import Interface
 from time import sleep
 import sys
@@ -40,6 +62,8 @@ class SerialInterface(Interface):
 
         self.rxb = 0
         self.txb = 0
+
+        self.HW_MTU = 564
         
         self.pyserial = serial
         self.serial   = None
@@ -52,6 +76,7 @@ class SerialInterface(Interface):
         self.stopbits = stopbits
         self.timeout  = 100
         self.online   = False
+        self.bitrate  = self.speed
 
         if parity.lower() == "e" or parity.lower() == "even":
             self.parity = serial.PARITY_EVEN
@@ -91,10 +116,10 @@ class SerialInterface(Interface):
     def configure_device(self):
         sleep(0.5)
         thread = threading.Thread(target=self.readLoop)
-        thread.setDaemon(True)
+        thread.daemon = True
         thread.start()
         self.online = True
-        RNS.log("Serial port "+self.port+" is now open")
+        RNS.log("Serial port "+self.port+" is now open", RNS.LOG_VERBOSE)
 
 
     def processIncoming(self, data):
@@ -129,7 +154,7 @@ class SerialInterface(Interface):
                     elif (byte == HDLC.FLAG):
                         in_frame = True
                         data_buffer = b""
-                    elif (in_frame and len(data_buffer) < RNS.Reticulum.MTU):
+                    elif (in_frame and len(data_buffer) < self.HW_MTU):
                         if (byte == HDLC.ESC):
                             escape = True
                         else:

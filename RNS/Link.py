@@ -1,19 +1,36 @@
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.fernet import Fernet
+# MIT License
+#
+# Copyright (c) 2016-2022 Mark Qvist / unsigned.io
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+from RNS.Cryptography import X25519PrivateKey, X25519PublicKey, Ed25519PrivateKey, Ed25519PublicKey
+from RNS.Cryptography import Fernet
+
 from time import sleep
 from .vendor import umsgpack as umsgpack
 import threading
-import base64
+import inspect
 import math
 import time
 import RNS
 
-import traceback
 
 class LinkCallbacks:
     def __init__(self):
@@ -29,7 +46,7 @@ class Link:
     """
     This class is used to establish and manage links to other peers. When a
     link instance is created, Reticulum will attempt to establish verified
-    connectivity with the specified destination.
+    and encrypted connectivity with the specified destination.
 
     :param destination: A :ref:`RNS.Destination<api-destination>` instance which to establish a link to.
     :param established_callback: An optional function or method with the signature *callback(link)* to be called when the link has been established.
@@ -43,19 +60,33 @@ class Link:
     ECPUBSIZE         = 32+32
     KEYSIZE           = 32
 
-    MDU = math.floor((RNS.Reticulum.MTU-RNS.Reticulum.HEADER_MINSIZE-RNS.Identity.FERNET_OVERHEAD)/RNS.Identity.AES128_BLOCKSIZE)*RNS.Identity.AES128_BLOCKSIZE - 1
+    MDU = math.floor((RNS.Reticulum.MTU-RNS.Reticulum.IFAC_MIN_SIZE-RNS.Reticulum.HEADER_MINSIZE-RNS.Identity.FERNET_OVERHEAD)/RNS.Identity.AES128_BLOCKSIZE)*RNS.Identity.AES128_BLOCKSIZE - 1
 
     ESTABLISHMENT_TIMEOUT_PER_HOP = RNS.Reticulum.DEFAULT_PER_HOP_TIMEOUT
     """
-    Default timeout for link establishment in seconds per hop to destination.
+    Timeout for link establishment in seconds per hop to destination.
     """
 
     TRAFFIC_TIMEOUT_FACTOR = 6
     KEEPALIVE_TIMEOUT_FACTOR = 4
+    """
+    RTT timeout factor used in link timeout calculation.
+    """
     STALE_GRACE = 2
+    """
+    Grace period in seconds used in link timeout calculation.
+    """
     KEEPALIVE = 360
     """
     Interval for sending keep-alive packets on established links in seconds.
+    """
+    STALE_TIME = 2*KEEPALIVE
+    """
+    If no traffic or keep-alive packets are received within this period, the
+    link will be marked as stale, and a final keep-alive packet will be sent.
+    If after this no traffic or keep-alive packets are received within ``RTT`` *
+    ``KEEPALIVE_TIMEOUT_FACTOR`` + ``STALE_GRACE``, the link is considered timed out,
+    and will be torn down.
     """
 
     PENDING   = 0x00
@@ -81,6 +112,7 @@ class Link:
                 link.set_link_id(packet)
                 link.destination = packet.destination
                 link.establishment_timeout = Link.ESTABLISHMENT_TIMEOUT_PER_HOP * max(1, packet.hops)
+                link.establishment_cost += len(packet.raw)
                 RNS.log("Validating link request "+RNS.prettyhexrep(link.link_id), RNS.LOG_VERBOSE)
                 link.handshake()
                 link.attached_interface = packet.receiving_interface
@@ -107,6 +139,7 @@ class Link:
         if destination != None and destination.type != RNS.Destination.SINGLE:
             raise TypeError("Links can only be established to the \"single\" destination type")
         self.rtt = None
+        self.establishment_cost = 0
         self.callbacks = LinkCallbacks()
         self.resource_strategy = Link.ACCEPT_NONE
         self.outgoing_resources = []
@@ -121,6 +154,7 @@ class Link:
         self.traffic_timeout_factor = Link.TRAFFIC_TIMEOUT_FACTOR
         self.keepalive_timeout_factor = Link.KEEPALIVE_TIMEOUT_FACTOR
         self.keepalive = Link.KEEPALIVE
+        self.stale_time = Link.STALE_TIME
         self.watchdog_lock = False
         self.status = Link.PENDING
         self.activated_at = None
@@ -131,7 +165,7 @@ class Link:
         self.__remote_identity = None
         if self.destination == None:
             self.initiator = False
-            self.prv     = self.owner.identity.prv
+            self.prv     = X25519PrivateKey.generate()
             self.sig_prv = self.owner.identity.sig_prv
         else:
             self.initiator = True
@@ -142,16 +176,10 @@ class Link:
         self.fernet  = None
         
         self.pub = self.prv.public_key()
-        self.pub_bytes = self.pub.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw
-        )
+        self.pub_bytes = self.pub.public_bytes()
 
         self.sig_pub = self.sig_prv.public_key()
-        self.sig_pub_bytes = self.sig_pub.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw
-        )
+        self.sig_pub_bytes = self.sig_pub.public_bytes()
 
         if peer_pub_bytes == None:
             self.peer_pub = None
@@ -166,14 +194,11 @@ class Link:
             self.set_link_closed_callback(closed_callback)
 
         if (self.initiator):
-            peer_pub_bytes = self.destination.identity.get_public_key()[:Link.ECPUBSIZE//2]
-            peer_sig_pub_bytes = self.destination.identity.get_public_key()[Link.ECPUBSIZE//2:Link.ECPUBSIZE]
             self.request_data = self.pub_bytes+self.sig_pub_bytes
             self.packet = RNS.Packet(destination, self.request_data, packet_type=RNS.Packet.LINKREQUEST)
             self.packet.pack()
+            self.establishment_cost += len(self.packet.raw)
             self.set_link_id(self.packet)
-            self.load_peer(peer_pub_bytes, peer_sig_pub_bytes)
-            self.handshake()
             RNS.Transport.register_link(self)
             self.request_time = time.time()
             self.start_watchdog()
@@ -199,20 +224,23 @@ class Link:
     def handshake(self):
         self.status = Link.HANDSHAKE
         self.shared_key = self.prv.exchange(self.peer_pub)
-        self.derived_key = HKDF(
-            algorithm=hashes.SHA256(),
+
+        self.derived_key = RNS.Cryptography.hkdf(
             length=32,
+            derive_from=self.shared_key,
             salt=self.get_salt(),
-            info=self.get_context(),
-        ).derive(self.shared_key)
+            context=self.get_context(),
+        )
+
 
     def prove(self):
         signed_data = self.link_id+self.pub_bytes+self.sig_pub_bytes
         signature = self.owner.identity.sign(signed_data)
 
-        proof_data = signature
+        proof_data = signature+self.pub_bytes
         proof = RNS.Packet(self, proof_data, packet_type=RNS.Packet.PROOF, context=RNS.Packet.LRPROOF)
         proof.send()
+        self.establishment_cost += len(proof.raw)
         self.had_outbound()
 
 
@@ -230,8 +258,14 @@ class Link:
         self.had_outbound()
 
     def validate_proof(self, packet):
-        if self.status == Link.HANDSHAKE:
-            if self.initiator and len(packet.data) == RNS.Identity.SIGLENGTH//8:
+        if self.status == Link.PENDING:
+            if self.initiator and len(packet.data) == RNS.Identity.SIGLENGTH//8+Link.ECPUBSIZE//2:
+                peer_pub_bytes = packet.data[RNS.Identity.SIGLENGTH//8:RNS.Identity.SIGLENGTH//8+Link.ECPUBSIZE//2]
+                peer_sig_pub_bytes = self.destination.identity.get_public_key()[Link.ECPUBSIZE//2:Link.ECPUBSIZE]
+                self.load_peer(peer_pub_bytes, peer_sig_pub_bytes)
+                self.handshake()
+
+                self.establishment_cost += len(packet.raw)
                 signed_data = self.link_id+self.peer_pub_bytes+self.peer_sig_pub_bytes
                 signature = packet.data[:RNS.Identity.SIGLENGTH//8]
                 
@@ -239,18 +273,18 @@ class Link:
                     self.rtt = time.time() - self.request_time
                     self.attached_interface = packet.receiving_interface
                     self.__remote_identity = self.destination.identity
+                    self.status = Link.ACTIVE
+                    self.activated_at = time.time()
                     RNS.Transport.activate_link(self)
-                    RNS.log("Link "+str(self)+" established with "+str(self.destination)+", RTT is "+str(self.rtt), RNS.LOG_VERBOSE)
+                    RNS.log("Link "+str(self)+" established with "+str(self.destination)+", RTT is "+str(round(self.rtt, 3))+"s", RNS.LOG_VERBOSE)
                     rtt_data = umsgpack.packb(self.rtt)
                     rtt_packet = RNS.Packet(self, rtt_data, context=RNS.Packet.LRRTT)
                     rtt_packet.send()
                     self.had_outbound()
 
-                    self.status = Link.ACTIVE
-                    self.activated_at = time.time()
                     if self.callbacks.link_established != None:
                         thread = threading.Thread(target=self.callbacks.link_established, args=(self,))
-                        thread.setDaemon(True)
+                        thread.daemon = True
                         thread.start()
                 else:
                     RNS.log("Invalid link proof signature received by "+str(self)+". Ignoring.", RNS.LOG_DEBUG)
@@ -307,7 +341,8 @@ class Link:
                     response_callback = response_callback,
                     failed_callback = failed_callback,
                     progress_callback = progress_callback,
-                    timeout = timeout
+                    timeout = timeout,
+                    request_size = len(packed_request),
                 )
             
         else:
@@ -321,7 +356,8 @@ class Link:
                 response_callback = response_callback,
                 failed_callback = failed_callback,
                 progress_callback = progress_callback,
-                timeout = timeout
+                timeout = timeout,
+                request_size = len(packed_request),
             )
 
 
@@ -356,7 +392,9 @@ class Link:
         """
         :returns: The time in seconds since last inbound packet on the link.
         """
-        return time.time() - self.last_inbound
+        activated_at = self.activated_at if self.activated_at != None else 0
+        last_inbound = max(self.last_inbound, activated_at)
+        return time.time() - last_inbound
 
     def no_outbound_for(self):
         """
@@ -372,7 +410,7 @@ class Link:
 
     def get_remote_identity(self):
         """
-        :returns: The identity of the remote peer, if it is known
+        :returns: The identity of the remote peer, if it is known. Calling this method will not query the remote initiator to reveal its identity. Returns ``None`` if the link initiator has not already independently called the ``identify(identity)`` method.
         """
         return self.__remote_identity
 
@@ -434,7 +472,7 @@ class Link:
 
     def start_watchdog(self):
         thread = threading.Thread(target=self.__watchdog_job)
-        thread.setDaemon(True)
+        thread.daemon = True
         thread.start()
 
     def __watchdog_job(self):
@@ -470,13 +508,21 @@ class Link:
                         sleep_time = 0.001
 
                 elif self.status == Link.ACTIVE:
-                    if time.time() >= self.last_inbound + self.keepalive:
-                        sleep_time = self.rtt * self.keepalive_timeout_factor + Link.STALE_GRACE
-                        self.status = Link.STALE
+                    activated_at = self.activated_at if self.activated_at != None else 0
+                    last_inbound = max(self.last_inbound, activated_at)
+
+                    if time.time() >= last_inbound + self.keepalive:
                         if self.initiator:
                             self.send_keepalive()
+
+                        if time.time() >= last_inbound + self.stale_time:
+                            sleep_time = self.rtt * self.keepalive_timeout_factor + Link.STALE_GRACE
+                            self.status = Link.STALE
+                        else:
+                            sleep_time = self.keepalive
+                    
                     else:
-                        sleep_time = (self.last_inbound + self.keepalive) - time.time()
+                        sleep_time = (last_inbound + self.keepalive) - time.time()
 
                 elif self.status == Link.STALE:
                     sleep_time = 0.001
@@ -516,14 +562,20 @@ class Link:
                 allowed = False
                 if not allow == RNS.Destination.ALLOW_NONE:
                     if allow == RNS.Destination.ALLOW_LIST:
-                        if self.__remote_identity.hash in allowed_list:
+                        if self.__remote_identity != None and self.__remote_identity.hash in allowed_list:
                             allowed = True
                     elif allow == RNS.Destination.ALLOW_ALL:
                         allowed = True
 
                 if allowed:
                     RNS.log("Handling request "+RNS.prettyhexrep(request_id)+" for: "+str(path), RNS.LOG_DEBUG)
-                    response = response_generator(path, request_data, request_id, self.__remote_identity, requested_at)
+                    if len(inspect.signature(response_generator).parameters) == 5:
+                        response = response_generator(path, request_data, request_id, self.__remote_identity, requested_at)
+                    elif len(inspect.signature(response_generator).parameters) == 6:
+                        response = response_generator(path, request_data, request_id, self.link_id, self.__remote_identity, requested_at)
+                    else:
+                        raise TypeError("Invalid signature for response generator callback")
+
                     if response != None:
                         packed_response = umsgpack.packb([request_id, response])
 
@@ -551,7 +603,8 @@ class Link:
                     break
 
             if remove != None:
-                self.pending_requests.remove(remove)
+                if remove in self.pending_requests:
+                    self.pending_requests.remove(remove)
 
     def request_resource_concluded(self, resource):
         if resource.status == RNS.Resource.COMPLETE:
@@ -595,7 +648,7 @@ class Link:
                         plaintext = self.decrypt(packet.data)
                         if self.callbacks.packet != None:
                             thread = threading.Thread(target=self.callbacks.packet, args=(plaintext, packet))
-                            thread.setDaemon(True)
+                            thread.daemon = True
                             thread.start()
                         
                         if self.destination.proof_strategy == RNS.Destination.PROVE_ALL:
@@ -622,7 +675,7 @@ class Link:
                                 self.__remote_identity = identity
                                 if self.callbacks.remote_identified != None:
                                     try:
-                                        self.callbacks.remote_identified(self.__remote_identity)
+                                        self.callbacks.remote_identified(self, self.__remote_identity)
                                     except Exception as e:
                                         RNS.log("Error while executing remote identified callback from "+str(self)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
 
@@ -659,19 +712,21 @@ class Link:
                         if RNS.ResourceAdvertisement.is_request(packet):
                             RNS.Resource.accept(packet, callback=self.request_resource_concluded)
                         elif RNS.ResourceAdvertisement.is_response(packet):
-                            request_id = RNS.ResourceAdvertisement.get_request_id(packet)
+                            request_id = RNS.ResourceAdvertisement.read_request_id(packet)
                             for pending_request in self.pending_requests:
                                 if pending_request.request_id == request_id:
                                     RNS.Resource.accept(packet, callback=self.response_resource_concluded, progress_callback=pending_request.response_resource_progress, request_id = request_id)
-                                    pending_request.response_size = RNS.ResourceAdvertisement.get_size(packet)
-                                    pending_request.response_transfer_size = RNS.ResourceAdvertisement.get_transfer_size(packet)
+                                    pending_request.response_size = RNS.ResourceAdvertisement.read_size(packet)
+                                    pending_request.response_transfer_size = RNS.ResourceAdvertisement.read_transfer_size(packet)
                                     pending_request.started_at = time.time()
                         elif self.resource_strategy == Link.ACCEPT_NONE:
                             pass
                         elif self.resource_strategy == Link.ACCEPT_APP:
                             if self.callbacks.resource != None:
                                 try:
-                                    if self.callbacks.resource(resource):
+                                    resource_advertisement = RNS.ResourceAdvertisement.unpack(packet.plaintext)
+                                    resource_advertisement.link = self
+                                    if self.callbacks.resource(resource_advertisement):
                                         RNS.Resource.accept(packet, self.callbacks.resource_concluded)
                                 except Exception as e:
                                     RNS.log("Error while executing resource accept callback from "+str(self)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
@@ -684,6 +739,7 @@ class Link:
                             resource_hash = plaintext[1+RNS.Resource.MAPHASH_LEN:RNS.Identity.HASHLENGTH//8+1+RNS.Resource.MAPHASH_LEN]
                         else:
                             resource_hash = plaintext[1:RNS.Identity.HASHLENGTH//8+1]
+
                         for resource in self.outgoing_resources:
                             if resource.hash == resource_hash:
                                 # We need to check that this request has not been
@@ -735,21 +791,12 @@ class Link:
         try:
             if not self.fernet:
                 try:
-                    self.fernet = Fernet(base64.urlsafe_b64encode(self.derived_key))
+                    self.fernet = Fernet(self.derived_key)
                 except Exception as e:
                     RNS.log("Could not "+str(self)+" instantiate Fernet while performin encryption on link. The contained exception was: "+str(e), RNS.LOG_ERROR)
                     raise e
 
-            # The fernet token VERSION field is stripped here and
-            # reinserted on the receiving end, since it is always
-            # set to 0x80.
-            #
-            # Since we're also quite content with supporting time-
-            # stamps until the year 8921556 AD, we'll also strip 2
-            # bytes from the timestamp field and reinsert those as
-            # 0x00 when received.
-            ciphertext = base64.urlsafe_b64decode(self.fernet.encrypt(plaintext))[3:]
-            return ciphertext
+            return self.fernet.encrypt(plaintext)
 
         except Exception as e:
             RNS.log("Encryption on link "+str(self)+" failed. The contained exception was: "+str(e), RNS.LOG_ERROR)
@@ -759,15 +806,12 @@ class Link:
     def decrypt(self, ciphertext):
         try:
             if not self.fernet:
-                self.fernet = Fernet(base64.urlsafe_b64encode(self.derived_key))
+                self.fernet = Fernet(self.derived_key)
                 
-            plaintext = self.fernet.decrypt(base64.urlsafe_b64encode(bytes([RNS.Identity.FERNET_VERSION, 0x00, 0x00])+ciphertext))
-            return plaintext
+            return self.fernet.decrypt(ciphertext)
+
         except Exception as e:
             RNS.log("Decryption failed on link "+str(self)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
-            # RNS.log(traceback.format_exc(), RNS.LOG_ERROR)
-            # TODO: Think long about implications here
-            # self.teardown()
 
 
     def sign(self, message):
@@ -784,6 +828,12 @@ class Link:
         self.callbacks.link_established = callback
 
     def set_link_closed_callback(self, callback):
+        """
+        Registers a function to be called when a link has been
+        torn down.
+
+        :param callback: A function or method with the signature *callback(link)* to be called.
+        """
         self.callbacks.link_closed = callback
 
     def set_packet_callback(self, callback):
@@ -802,7 +852,7 @@ class Link:
         the resource will be accepted. If it returns *False* it will
         be ignored.
 
-        :param callback: A function or method with the signature *callback(resource)* to be called.
+        :param callback: A function or method with the signature *callback(resource)* to be called. Please note that only the basic information of the resource is available at this time, such as *get_transfer_size()*, *get_data_size()*, *get_parts()* and *is_compressed()*.
         """
         self.callbacks.resource = callback
 
@@ -829,7 +879,7 @@ class Link:
         Registers a function to be called when an initiating peer has
         identified over this link.
 
-        :param callback: A function or method with the signature *callback(identity)* to be called.
+        :param callback: A function or method with the signature *callback(link, identity)* to be called.
         """
         self.callbacks.remote_identified = callback
 
@@ -856,6 +906,13 @@ class Link:
 
     def register_incoming_resource(self, resource):
         self.incoming_resources.append(resource)
+
+    def has_incoming_resource(self, resource):
+        for incoming_resource in self.incoming_resources:
+            if incoming_resource.hash == resource.hash:
+                return True
+
+        return False
 
     def cancel_outgoing_resource(self, resource):
         if resource in self.outgoing_resources:
@@ -892,7 +949,7 @@ class RequestReceipt():
     RECEIVING = 0x03
     READY     = 0x04
 
-    def __init__(self, link, packet_receipt = None, resource = None, response_callback = None, failed_callback = None, progress_callback = None, timeout = None):
+    def __init__(self, link, packet_receipt = None, resource = None, response_callback = None, failed_callback = None, progress_callback = None, timeout = None, request_size = None):
         self.packet_receipt = packet_receipt
         self.resource = resource
         self.started_at = None
@@ -908,6 +965,7 @@ class RequestReceipt():
         
         self.link                   = link
         self.request_id             = self.hash
+        self.request_size           = request_size
 
         self.response               = None
         self.response_transfer_size = None
@@ -938,7 +996,7 @@ class RequestReceipt():
             self.status = RequestReceipt.DELIVERED
             self.__resource_response_timeout = time.time()+self.timeout
             response_timeout_thread = threading.Thread(target=self.__response_timeout_job)
-            response_timeout_thread.setDaemon(True)
+            response_timeout_thread.daemon = True
             response_timeout_thread.start()
         else:
             RNS.log("Sending request "+RNS.prettyhexrep(self.request_id)+" as resource failed with status: "+RNS.hexrep([resource.status]), RNS.LOG_DEBUG)

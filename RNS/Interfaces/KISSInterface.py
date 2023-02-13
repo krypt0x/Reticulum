@@ -1,3 +1,25 @@
+# MIT License
+#
+# Copyright (c) 2016-2022 Mark Qvist / unsigned.io
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 from .Interface import Interface
 from time import sleep
 import sys
@@ -29,6 +51,7 @@ class KISS():
 
 class KISSInterface(Interface):
     MAX_CHUNK = 32768
+    BITRATE_GUESS = 1200
 
     owner    = None
     port     = None
@@ -50,6 +73,8 @@ class KISSInterface(Interface):
         self.rxb = 0
         self.txb = 0
         
+        self.HW_MTU = 564
+        
         if beacon_data == None:
             beacon_data = ""
 
@@ -67,6 +92,7 @@ class KISSInterface(Interface):
         self.beacon_i = beacon_interval
         self.beacon_d = beacon_data.encode("utf-8")
         self.first_tx = None
+        self.bitrate  = KISSInterface.BITRATE_GUESS
 
         self.packet_queue    = []
         self.flow_control    = flow_control
@@ -118,7 +144,7 @@ class KISSInterface(Interface):
         # Allow time for interface to initialise before config
         sleep(2.0)
         thread = threading.Thread(target=self.readLoop)
-        thread.setDaemon(True)
+        thread.daemon = True
         thread.start()
         self.online = True
         RNS.log("Serial port "+self.port+" is now open")
@@ -255,7 +281,7 @@ class KISSInterface(Interface):
                         in_frame = True
                         command = KISS.CMD_UNKNOWN
                         data_buffer = b""
-                    elif (in_frame and len(data_buffer) < RNS.Reticulum.MTU):
+                    elif (in_frame and len(data_buffer) < self.HW_MTU):
                         if (len(data_buffer) == 0 and command == KISS.CMD_UNKNOWN):
                             # We only support one HDLC port for now, so
                             # strip off the port nibble

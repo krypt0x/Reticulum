@@ -1,3 +1,25 @@
+# MIT License
+#
+# Copyright (c) 2016-2022 Mark Qvist / unsigned.io
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 import threading
 import struct
 import math
@@ -7,15 +29,19 @@ import RNS
 class Packet:
     """
     The Packet class is used to create packet instances that can be sent
-    over a Reticulum network. Packets to will automatically be encrypted if
+    over a Reticulum network. Packets will automatically be encrypted if
     they are adressed to a ``RNS.Destination.SINGLE`` destination,
     ``RNS.Destination.GROUP`` destination or a :ref:`RNS.Link<api-link>`.
 
     For ``RNS.Destination.GROUP`` destinations, Reticulum will use the
-    pre-shared key configured for the destination.
+    pre-shared key configured for the destination. All packets to group
+    destinations are encrypted with the same AES-128 key.
 
-    For ``RNS.Destination.SINGLE`` destinations and :ref:`RNS.Link<api-link>`
-    destinations, reticulum will use ephemeral keys, and offers **Forward Secrecy**.
+    For ``RNS.Destination.SINGLE`` destinations, Reticulum will use a newly
+    derived ephemeral AES-128 key for every packet.
+
+    For :ref:`RNS.Link<api-link>` destinations, Reticulum will use per-link
+    ephemeral keys, and offers **Forward Secrecy**.
 
     :param destination: A :ref:`RNS.Destination<api-destination>` instance to which the packet will be sent.
     :param data: The data payload to be included in the packet as *bytes*.
@@ -32,9 +58,7 @@ class Packet:
     # Header types
     HEADER_1     = 0x00     # Normal header format
     HEADER_2     = 0x01     # Header format used for packets in transport
-    HEADER_3     = 0x02     # Reserved
-    HEADER_4     = 0x03     # Reserved
-    header_types = [HEADER_1, HEADER_2, HEADER_3, HEADER_4]
+    header_types = [HEADER_1, HEADER_2]
 
     # Packet context types
     NONE           = 0x00   # Generic data packet
@@ -72,7 +96,7 @@ class Packet:
     """
     PLAIN_MDU      = MDU
     """
-    The maximum size of the payload data in a single unencrypted packet 
+    The maximum size of the payload data in a single unencrypted packet
     """
 
     TIMEOUT_PER_HOP = RNS.Reticulum.DEFAULT_PER_HOP_TIMEOUT
@@ -189,21 +213,23 @@ class Packet:
             self.flags = self.raw[0]
             self.hops  = self.raw[1]
 
-            self.header_type      = (self.flags & 0b11000000) >> 6
+            self.header_type      = (self.flags & 0b01000000) >> 6
             self.transport_type   = (self.flags & 0b00110000) >> 4
             self.destination_type = (self.flags & 0b00001100) >> 2
             self.packet_type      = (self.flags & 0b00000011)
 
+            DST_LEN = RNS.Reticulum.TRUNCATED_HASHLENGTH//8
+
             if self.header_type == Packet.HEADER_2:
-                self.transport_id = self.raw[2:12]
-                self.destination_hash = self.raw[12:22]
-                self.context = ord(self.raw[22:23])
-                self.data = self.raw[23:]
+                self.transport_id = self.raw[2:DST_LEN+2]
+                self.destination_hash = self.raw[DST_LEN+2:2*DST_LEN+2]
+                self.context = ord(self.raw[2*DST_LEN+2:2*DST_LEN+3])
+                self.data = self.raw[2*DST_LEN+3:]
             else:
                 self.transport_id = None
-                self.destination_hash = self.raw[2:12]
-                self.context = ord(self.raw[12:13])
-                self.data = self.raw[13:]
+                self.destination_hash = self.raw[2:DST_LEN+2]
+                self.context = ord(self.raw[DST_LEN+2:DST_LEN+3])
+                self.data = self.raw[DST_LEN+3:]
 
             self.packed = False
             self.update_hash()
@@ -230,7 +256,7 @@ class Packet:
 
             if not self.packed:
                 self.pack()
-    
+
             if RNS.Transport.outbound(self):
                 return self.receipt
             else:
@@ -291,7 +317,7 @@ class Packet:
     def get_hashable_part(self):
         hashable_part = bytes([self.raw[0] & 0b00001111])
         if self.header_type == Packet.HEADER_2:
-            hashable_part += self.raw[12:]
+            hashable_part += self.raw[(RNS.Identity.TRUNCATED_HASHLENGTH//8)+2:]
         else:
             hashable_part += self.raw[2:]
 
@@ -299,7 +325,7 @@ class Packet:
 
 class ProofDestination:
     def __init__(self, packet):
-        self.hash = packet.get_hash()[:10];
+        self.hash = packet.get_hash()[:RNS.Reticulum.TRUNCATED_HASHLENGTH//8];
         self.type = RNS.Destination.SINGLE
 
     def encrypt(self, plaintext):
@@ -466,7 +492,7 @@ class PacketReceipt:
 
             if self.callbacks.timeout:
                 thread = threading.Thread(target=self.callbacks.timeout, args=(self,))
-                thread.setDaemon(True)
+                thread.daemon = True
                 thread.start()
 
 

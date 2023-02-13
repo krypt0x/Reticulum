@@ -1,3 +1,25 @@
+# MIT License
+#
+# Copyright (c) 2016-2022 Mark Qvist / unsigned.io
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 import RNS
 import os
 import bz2
@@ -20,10 +42,39 @@ class Resource:
     :param callback: An optional *callable* with the signature *callback(resource)*. Will be called when the resource transfer concludes.
     :param progress_callback: An optional *callable* with the signature *callback(resource)*. Will be called whenever the resource transfer progress is updated.
     """
-    WINDOW_FLEXIBILITY   = 4
-    WINDOW_MIN           = 1
-    WINDOW_MAX           = 10
+
+    # The initial window size at beginning of transfer
     WINDOW               = 4
+
+    # Absolute minimum window size during transfer
+    WINDOW_MIN           = 1
+
+    # The maximum window size for transfers on slow links
+    WINDOW_MAX_SLOW      = 10
+
+    # The maximum window size for transfers on fast links
+    WINDOW_MAX_FAST      = 75
+    
+    # For calculating maps and guard segments, this
+    # must be set to the global maximum window.
+    WINDOW_MAX           = WINDOW_MAX_FAST
+    
+    # If the fast rate is sustained for this many request
+    # rounds, the fast link window size will be allowed.
+    FAST_RATE_THRESHOLD  = WINDOW_MAX_SLOW - WINDOW - 2
+
+    # If the RTT rate is higher than this value,
+    # the max window size for fast links will be used.
+    # The default is 50 Kbps (the value is stored in
+    # bytes per second, hence the "/ 8").
+    RATE_FAST            = (50*1000) / 8
+
+    # The minimum allowed flexibility of the window size.
+    # The difference between window_max and window_min
+    # will never be smaller than this value.
+    WINDOW_FLEXIBILITY   = 4
+
+    # Number of bytes in a map hash
     MAPHASH_LEN          = 4
     SDU                  = RNS.Packet.MDU
     RANDOM_HASH_SIZE     = 4
@@ -52,9 +103,11 @@ class Resource:
 
     PART_TIMEOUT_FACTOR           = 4
     PART_TIMEOUT_FACTOR_AFTER_RTT = 2
-    MAX_RETRIES                   = 5
+    MAX_RETRIES                   = 8
+    MAX_ADV_RETRIES               = 4
     SENDER_GRACE_TIME             = 10
     RETRY_GRACE_TIME              = 0.25
+    PER_RETRY_DELAY               = 0.5
 
     WATCHDOG_MAX_SLEEP            = 1
 
@@ -98,7 +151,7 @@ class Resource:
             resource.outstanding_parts   = 0
             resource.parts                 = [None] * resource.total_parts
             resource.window              = Resource.WINDOW
-            resource.window_max          = Resource.WINDOW_MAX
+            resource.window_max          = Resource.WINDOW_MAX_SLOW
             resource.window_min          = Resource.WINDOW_MIN
             resource.window_flexibility  = Resource.WINDOW_FLEXIBILITY
             resource.last_activity       = time.time()
@@ -119,20 +172,26 @@ class Resource:
 
             resource.consecutive_completed_height = 0
             
-            resource.link.register_incoming_resource(resource)
+            if not resource.link.has_incoming_resource(resource):
+                resource.link.register_incoming_resource(resource)
 
-            RNS.log("Accepting resource advertisement for "+RNS.prettyhexrep(resource.hash), RNS.LOG_DEBUG)
-            if resource.link.callbacks.resource_started != None:
-                try:
-                    resource.link.callbacks.resource_started(resource)
-                except Exception as e:
-                    RNS.log("Error while executing resource started callback from "+str(self)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
+                RNS.log("Accepting resource advertisement for "+RNS.prettyhexrep(resource.hash), RNS.LOG_DEBUG)
+                if resource.link.callbacks.resource_started != None:
+                    try:
+                        resource.link.callbacks.resource_started(resource)
+                    except Exception as e:
+                        RNS.log("Error while executing resource started callback from "+str(resource)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
 
-            resource.hashmap_update(0, resource.hashmap_raw)
+                resource.hashmap_update(0, resource.hashmap_raw)
 
-            resource.watchdog_job()
+                resource.watchdog_job()
 
-            return resource
+                return resource
+
+            else:
+                RNS.log("Ignoring resource advertisement for "+RNS.prettyhexrep(resource.hash)+", resource already transferring", RNS.LOG_DEBUG)
+                return None
+
         except Exception as e:
             RNS.log("Could not decode resource advertisement, dropping resource", RNS.LOG_DEBUG)
             return None
@@ -143,6 +202,8 @@ class Resource:
     def __init__(self, data, link, advertise=True, auto_compress=True, callback=None, progress_callback=None, timeout = None, segment_index = 1, original_hash = None, request_id = None, is_response = False):
         data_size = None
         resource_data = None
+        self.assembly_lock = False
+
         if hasattr(data, "read"):
             data_size = os.stat(data.name).st_size
             self.total_size  = data_size
@@ -186,6 +247,7 @@ class Resource:
         self.status = Resource.NONE
         self.link = link
         self.max_retries = Resource.MAX_RETRIES
+        self.max_adv_retries = Resource.MAX_ADV_RETRIES
         self.retries_left = self.max_retries
         self.timeout_factor = self.link.traffic_timeout_factor
         self.part_timeout_factor = Resource.PART_TIMEOUT_FACTOR
@@ -195,6 +257,11 @@ class Resource:
         self.__watchdog_job_id = 0
         self.__progress_callback = progress_callback
         self.rtt = None
+        self.rtt_rxd_bytes = 0
+        self.req_sent = 0
+        self.req_resp_rtt_rate = 0
+        self.rtt_rxd_bytes_at_part_req = 0
+        self.fast_rate_rounds = 0
         self.request_id = request_id
         self.is_response = is_response
 
@@ -332,12 +399,11 @@ class Resource:
         the resource advertisement it will begin transferring.
         """
         thread = threading.Thread(target=self.__advertise_job)
-        thread.setDaemon(True)
+        thread.daemon = True
         thread.start()
 
     def __advertise_job(self):
-        data = ResourceAdvertisement(self).pack()
-        self.advertisement_packet = RNS.Packet(self.link, data, context=RNS.Packet.RESOURCE_ADV)
+        self.advertisement_packet = RNS.Packet(self.link, ResourceAdvertisement(self).pack(), context=RNS.Packet.RESOURCE_ADV)
         while not self.link.ready_for_new_resource():
             self.status = Resource.QUEUED
             sleep(0.25)
@@ -348,6 +414,7 @@ class Resource:
             self.adv_sent = self.last_activity
             self.rtt = None
             self.status = Resource.ADVERTISED
+            self.retries_left = self.max_adv_retries
             self.link.register_outgoing_resource(self)
             RNS.log("Sent resource advertisement for "+RNS.prettyhexrep(self.hash), RNS.LOG_DEBUG)
         except Exception as e:
@@ -359,7 +426,7 @@ class Resource:
 
     def watchdog_job(self):
         thread = threading.Thread(target=self.__watchdog_job)
-        thread.setDaemon(True)
+        thread.daemon = True
         thread.start()
 
     def __watchdog_job(self):
@@ -383,7 +450,8 @@ class Resource:
                         try:
                             RNS.log("No part requests received, retrying resource advertisement...", RNS.LOG_DEBUG)
                             self.retries_left -= 1
-                            self.advertisement_packet.resend()
+                            self.advertisement_packet = RNS.Packet(self.link, ResourceAdvertisement(self).pack(), context=RNS.Packet.RESOURCE_ADV)
+                            self.advertisement_packet.send()
                             self.last_activity = time.time()
                             self.adv_sent = self.last_activity
                             sleep_time = 0.001
@@ -402,7 +470,9 @@ class Resource:
 
                     window_remaining = self.outstanding_parts
 
-                    sleep_time = self.last_activity + (rtt*(self.part_timeout_factor+window_remaining)) + Resource.RETRY_GRACE_TIME - time.time()
+                    retries_used = self.max_retries - self.retries_left
+                    extra_wait = retries_used * Resource.PER_RETRY_DELAY
+                    sleep_time = self.last_activity + (rtt*(self.part_timeout_factor+window_remaining)) + Resource.RETRY_GRACE_TIME + extra_wait - time.time()
                     
                     if sleep_time < 0:
                         if self.retries_left > 0:
@@ -422,7 +492,8 @@ class Resource:
                             self.cancel()
                             sleep_time = 0.001
                 else:
-                    max_wait = self.rtt * self.timeout_factor * self.max_retries + self.sender_grace_time
+                    max_extra_wait = sum([(r+1) * Resource.PER_RETRY_DELAY for r in range(self.MAX_RETRIES)])
+                    max_wait = self.rtt * self.timeout_factor * self.max_retries + self.sender_grace_time + max_extra_wait
                     sleep_time = self.last_activity + max_wait - time.time()
                     if sleep_time < 0:
                         RNS.log("Resource timed out waiting for part requests", RNS.LOG_DEBUG)
@@ -502,8 +573,11 @@ class Resource:
                         RNS.log("Error while executing resource assembled callback from "+str(self)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
 
                 try:
-                    self.data.close()
+                    if hasattr(self.data, "close") and callable(self.data.close):
+                        self.data.close()
+
                     os.unlink(self.storagepath)
+
                 except Exception as e:
                     RNS.log("Error while cleaning up resource files, the contained exception was:", RNS.LOG_ERROR)
                     RNS.log(str(e))
@@ -540,7 +614,7 @@ class Resource:
                     else:
                         # Otherwise we'll recursively create the
                         # next segment of the resource
-                        Resource(self.input_file, self.link, callback = self.callback, segment_index = self.segment_index+1, original_hash=self.original_hash)
+                        Resource(self.input_file, self.link, callback = self.callback, segment_index = self.segment_index+1, original_hash=self.original_hash, progress_callback = self.__progress_callback)
                 else:
                     pass
             else:
@@ -558,7 +632,7 @@ class Resource:
         if self.req_resp == None:
             self.req_resp = self.last_activity
             rtt = self.req_resp-self.req_sent
-
+            
             self.part_timeout_factor = Resource.PART_TIMEOUT_FACTOR_AFTER_RTT
             if self.rtt == None:
                 self.rtt = self.link.rtt
@@ -567,6 +641,16 @@ class Resource:
                 self.rtt = max(self.rtt - self.rtt*0.05, rtt)
             elif rtt > self.rtt:
                 self.rtt = min(self.rtt + self.rtt*0.05, rtt)
+
+            if rtt > 0:
+                req_resp_cost = len(packet.raw)+self.req_sent_bytes
+                self.req_resp_rtt_rate = req_resp_cost / rtt
+
+                if self.req_resp_rtt_rate > Resource.RATE_FAST and self.fast_rate_rounds < Resource.FAST_RATE_THRESHOLD:
+                    self.fast_rate_rounds += 1
+
+                    if self.fast_rate_rounds == Resource.FAST_RATE_THRESHOLD:
+                        self.window_max = Resource.WINDOW_MAX_FAST
 
         if not self.status == Resource.FAILED:
             self.status = Resource.TRANSFERRING
@@ -579,6 +663,7 @@ class Resource:
                     if self.parts[i] == None:
                         # Insert data into parts list
                         self.parts[i] = part_data
+                        self.rtt_rxd_bytes += len(part_data)
                         self.received_count += 1
                         self.outstanding_parts -= 1
 
@@ -601,7 +686,8 @@ class Resource:
 
             self.receiving_part = False
 
-            if self.received_count == self.total_parts:
+            if self.received_count == self.total_parts and not self.assembly_lock:
+                self.assembly_lock = True
                 self.assemble()
             elif self.outstanding_parts == 0:
                 # TODO: Figure out if there is a mathematically
@@ -610,6 +696,20 @@ class Resource:
                     self.window += 1
                     if (self.window - self.window_min) > (self.window_flexibility-1):
                         self.window_min += 1
+
+                if self.req_sent != 0:
+                    rtt = time.time()-self.req_sent
+                    req_transferred = self.rtt_rxd_bytes - self.rtt_rxd_bytes_at_part_req
+
+                    if rtt != 0:
+                        self.req_data_rtt_rate = req_transferred/rtt
+                        self.rtt_rxd_bytes_at_part_req = self.rtt_rxd_bytes
+
+                        if self.req_data_rtt_rate > Resource.RATE_FAST and self.fast_rate_rounds < Resource.FAST_RATE_THRESHOLD:
+                            self.fast_rate_rounds += 1
+
+                            if self.fast_rate_rounds == Resource.FAST_RATE_THRESHOLD:
+                                self.window_max = Resource.WINDOW_MAX_FAST
 
                 self.request_next()
         else:
@@ -658,6 +758,7 @@ class Resource:
                     request_packet.send()
                     self.last_activity = time.time()
                     self.req_sent = self.last_activity
+                    self.req_sent_bytes = len(request_packet.raw)
                     self.req_resp = None
                 except Exception as e:
                     RNS.log("Could not send resource request packet, cancelling resource", RNS.LOG_DEBUG)
@@ -682,27 +783,34 @@ class Resource:
 
             requested_hashes = request_data[pad+RNS.Identity.HASHLENGTH//8:]
 
-            for i in range(0,len(requested_hashes)//Resource.MAPHASH_LEN):
-                requested_hash = requested_hashes[i*Resource.MAPHASH_LEN:(i+1)*Resource.MAPHASH_LEN]
-                
-                search_start = self.receiver_min_consecutive_height
-                search_end   = self.receiver_min_consecutive_height+ResourceAdvertisement.COLLISION_GUARD_SIZE
-                for part in self.parts[search_start:search_end]:
-                    if part.map_hash == requested_hash:
-                        try:
-                            if not part.sent:
-                                part.send()
-                                self.sent_parts += 1
-                            else:
-                                part.resend()
-                            self.last_activity = time.time()
-                            self.last_part_sent = self.last_activity
-                            break
-                        except Exception as e:
-                            RNS.log("Resource could not send parts, cancelling transfer!", RNS.LOG_DEBUG)
-                            RNS.log("The contained exception was: "+str(e), RNS.LOG_DEBUG)
-                            self.cancel()
+            # Define the search scope
+            search_start = self.receiver_min_consecutive_height
+            search_end   = self.receiver_min_consecutive_height+ResourceAdvertisement.COLLISION_GUARD_SIZE
 
+            map_hashes = []
+            for i in range(0,len(requested_hashes)//Resource.MAPHASH_LEN):
+                map_hash = requested_hashes[i*Resource.MAPHASH_LEN:(i+1)*Resource.MAPHASH_LEN]
+                map_hashes.append(map_hash)
+
+            search_scope = self.parts[search_start:search_end]
+            requested_parts = list(filter(lambda part: part.map_hash in map_hashes, search_scope))
+
+            for part in requested_parts:
+                try:
+                    if not part.sent:
+                        part.send()
+                        self.sent_parts += 1
+                    else:
+                        part.resend()
+
+                    self.last_activity = time.time()
+                    self.last_part_sent = self.last_activity
+
+                except Exception as e:
+                    RNS.log("Resource could not send parts, cancelling transfer!", RNS.LOG_DEBUG)
+                    RNS.log("The contained exception was: "+str(e), RNS.LOG_DEBUG)
+                    self.cancel()
+            
             if wants_more_hashmap:
                 last_map_hash = request_data[1:Resource.MAPHASH_LEN+1]
                 
@@ -801,12 +909,48 @@ class Resource:
         progress = self.processed_parts / self.progress_total_parts
         return progress
 
+    def get_transfer_size(self):
+        """
+        :returns: The number of bytes needed to transfer the resource.
+        """
+        return self.size
+
+    def get_data_size(self):
+        """
+        :returns: The total data size of the resource.
+        """
+        return self.total_size
+
+    def get_parts(self):
+        """
+        :returns: The number of parts the resource will be transferred in.
+        """
+        return self.total_parts
+
+    def get_segments(self):
+        """
+        :returns: The number of segments the resource is divided into.
+        """
+        return self.total_segments
+
+    def get_hash(self):
+        """
+        :returns: The hash of the resource.
+        """
+        return self.hash
+
+    def is_compressed(self):
+        """
+        :returns: Whether the resource is compressed.
+        """
+        return self.compressed
+
     def __str__(self):
-        return "<"+RNS.hexrep(self.hash)+"/"+RNS.hexrep(self.link.link_id)+">"
+        return "<"+RNS.hexrep(self.hash,delimit=False)+"/"+RNS.hexrep(self.link.link_id,delimit=False)+">"
 
 
 class ResourceAdvertisement:
-    OVERHEAD             = 128
+    OVERHEAD             = 134
     HASHMAP_MAX_LEN      = math.floor((RNS.Link.MDU-OVERHEAD)/Resource.MAPHASH_LEN)
     COLLISION_GUARD_SIZE = 2*Resource.WINDOW_MAX+HASHMAP_MAX_LEN
 
@@ -832,19 +976,19 @@ class ResourceAdvertisement:
 
 
     @staticmethod
-    def get_request_id(advertisement_packet):
+    def read_request_id(advertisement_packet):
         adv = ResourceAdvertisement.unpack(advertisement_packet.plaintext)
         return adv.q
 
 
     @staticmethod
-    def get_transfer_size(advertisement_packet):
+    def read_transfer_size(advertisement_packet):
         adv = ResourceAdvertisement.unpack(advertisement_packet.plaintext)
         return adv.t
 
 
     @staticmethod
-    def get_size(advertisement_packet):
+    def read_size(advertisement_packet):
         adv = ResourceAdvertisement.unpack(advertisement_packet.plaintext)
         return adv.d
 
@@ -878,6 +1022,23 @@ class ResourceAdvertisement:
             # Flags
             self.f = 0x00 | self.p << 4 | self.u << 3 | self.s << 2 | self.c << 1 | self.e
 
+    def get_transfer_size(self):
+        return self.t
+
+    def get_data_size(self):
+        return self.d
+
+    def get_parts(self):
+        return self.n
+
+    def get_segments(self):
+        return self.l
+
+    def get_hash(self):
+        return self.h
+
+    def is_compressed(self):
+        return self.c
 
     def pack(self, segment=0):
         hashmap_start = segment*ResourceAdvertisement.HASHMAP_MAX_LEN

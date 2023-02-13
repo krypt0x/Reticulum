@@ -1,11 +1,30 @@
-import base64
+# MIT License
+#
+# Copyright (c) 2016-2022 Mark Qvist / unsigned.io
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 import math
 import time
 import RNS
 
-from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.backends import default_backend
+from RNS.Cryptography import Fernet
 
 class Callbacks:
     def __init__(self):
@@ -50,8 +69,10 @@ class Destination:
     OUT        = 0x12;
     directions = [IN, OUT]
 
+    PR_TAG_WINDOW = 30
+
     @staticmethod
-    def full_name(app_name, *aspects):
+    def expand_name(identity, app_name, *aspects):
         """
         :returns: A string containing the full human-readable name of the destination, for an app_name and a number of aspects.
         """
@@ -62,23 +83,25 @@ class Destination:
         name = app_name
         for aspect in aspects:
             if "." in aspect: raise ValueError("Dots can't be used in aspects")
-            name = name + "." + aspect
+            name += "." + aspect
+
+        if identity != None:
+            name += "." + identity.hexhash
 
         return name
 
 
     @staticmethod
-    def hash(app_name, *aspects):
+    def hash(identity, app_name, *aspects):
         """
         :returns: A destination name in adressable hash form, for an app_name and a number of aspects.
         """
-        name = Destination.full_name(app_name, *aspects)
+        name_hash = RNS.Identity.full_hash(Destination.expand_name(None, app_name, *aspects).encode("utf-8"))[:(RNS.Identity.NAME_HASH_LENGTH//8)]
+        addr_hash_material = name_hash
+        if identity != None:
+            addr_hash_material += identity.hash
 
-        # Create a digest for the destination
-        digest = hashes.Hash(hashes.SHA256(), backend=default_backend())
-        digest.update(name.encode("UTF-8"))
-
-        return digest.finalize()[:10]
+        return RNS.Identity.full_hash(addr_hash_material)[:RNS.Reticulum.TRUNCATED_HASHLENGTH//8]
 
     @staticmethod
     def app_and_aspects_from_name(full_name):
@@ -94,14 +117,16 @@ class Destination:
         :returns: A destination name in adressable hash form, for a full name string and Identity instance.
         """
         app_name, aspects = Destination.app_and_aspects_from_name(full_name)
-        aspects.append(identity.hexhash)
-        return Destination.hash(app_name, *aspects)
+
+        return Destination.hash(identity, app_name, *aspects)
 
     def __init__(self, identity, direction, type, app_name, *aspects):
         # Check input values and build name string
         if "." in app_name: raise ValueError("Dots can't be used in app names") 
         if not type in Destination.types: raise ValueError("Unknown destination type")
         if not direction in Destination.directions: raise ValueError("Unknown destination direction")
+
+        self.accept_link_requests = True
         self.callbacks = Callbacks()
         self.request_handlers = {}
         self.type = type
@@ -109,22 +134,25 @@ class Destination:
         self.proof_strategy = Destination.PROVE_NONE
         self.mtu = 0
 
+        self.path_responses = {}
         self.links = []
-
-        if identity != None and type == Destination.SINGLE:
-            aspects = aspects+(identity.hexhash,)
 
         if identity == None and direction == Destination.IN and self.type != Destination.PLAIN:
             identity = RNS.Identity()
             aspects = aspects+(identity.hexhash,)
 
+        if identity != None and self.type == Destination.PLAIN:
+            raise TypeError("Selected destination type PLAIN cannot hold an identity")
+
         self.identity = identity
+        self.name = Destination.expand_name(identity, app_name, *aspects)
 
-        self.name = Destination.full_name(app_name, *aspects)      
-        self.hash = Destination.hash(app_name, *aspects)
+        # Generate the destination address hash
+        self.hash = Destination.hash(self.identity, app_name, *aspects)
+        self.name_hash = RNS.Identity.full_hash(self.expand_name(None, app_name, *aspects).encode("utf-8"))[:(RNS.Identity.NAME_HASH_LENGTH//8)]
         self.hexhash = self.hash.hex()
-        self.default_app_data = None
 
+        self.default_app_data = None
         self.callback = None
         self.proofcallback = None
 
@@ -138,7 +166,7 @@ class Destination:
         return "<"+self.name+"/"+self.hexhash+">"
 
 
-    def announce(self, app_data=None, path_response=False):
+    def announce(self, app_data=None, path_response=False, attached_interface=None, tag=None, send=True):
         """
         Creates an announce packet for this destination and broadcasts it on all
         relevant interfaces. Application specific data can be added to the announce.
@@ -146,42 +174,89 @@ class Destination:
         :param app_data: *bytes* containing the app_data.
         :param path_response: Internal flag used by :ref:`RNS.Transport<api-transport>`. Ignore.
         """
-        destination_hash = self.hash
-        random_hash = RNS.Identity.get_random_hash()[0:5]+int(time.time()).to_bytes(5, "big")
-
-        if app_data == None and self.default_app_data != None:
-            if isinstance(self.default_app_data, bytes):
-                app_data = self.default_app_data
-            elif callable(self.default_app_data):
-                returned_app_data = self.default_app_data()
-                if isinstance(returned_app_data, bytes):
-                    app_data = returned_app_data
+        if self.type != Destination.SINGLE:
+            raise TypeError("Only SINGLE destination types can be announced")
         
-        signed_data = self.hash+self.identity.get_public_key()+random_hash
-        if app_data != None:
-            signed_data += app_data
+        now = time.time()
+        stale_responses = []
+        for entry_tag in self.path_responses:
+            entry = self.path_responses[entry_tag]
+            if now > entry[0]+Destination.PR_TAG_WINDOW:
+                stale_responses.append(entry_tag)
 
-        signature = self.identity.sign(signed_data)
+        for entry_tag in stale_responses:
+            self.path_responses.pop(entry_tag)
 
-        announce_data = self.identity.get_public_key()+random_hash+signature
+        if (path_response == True and tag != None) and tag in self.path_responses:
+            # This code is currently not used, since Transport will block duplicate
+            # path requests based on tags. When multi-path support is implemented in
+            # Transport, this will allow Transport to detect redundant paths to the
+            # same destination, and select the best one based on chosen criteria,
+            # since it will be able to detect that a single emitted announce was
+            # received via multiple paths. The difference in reception time will
+            # potentially also be useful in determining characteristics of the
+            # multiple available paths, and to choose the best one.
+            RNS.log("Using cached announce data for answering path request with tag "+RNS.prettyhexrep(tag), RNS.LOG_EXTREME)
+            announce_data = self.path_responses[tag][1]
+        
+        else:
+            destination_hash = self.hash
+            random_hash = RNS.Identity.get_random_hash()[0:5]+int(time.time()).to_bytes(5, "big")
 
-        if app_data != None:
-            announce_data += app_data
+            if app_data == None and self.default_app_data != None:
+                if isinstance(self.default_app_data, bytes):
+                    app_data = self.default_app_data
+                elif callable(self.default_app_data):
+                    returned_app_data = self.default_app_data()
+                    if isinstance(returned_app_data, bytes):
+                        app_data = returned_app_data
+            
+            signed_data = self.hash+self.identity.get_public_key()+self.name_hash+random_hash
+            if app_data != None:
+                signed_data += app_data
+
+            signature = self.identity.sign(signed_data)
+
+            announce_data = self.identity.get_public_key()+self.name_hash+random_hash+signature
+
+            if app_data != None:
+                announce_data += app_data
+
+            self.path_responses[tag] = [time.time(), announce_data]
 
         if path_response:
             announce_context = RNS.Packet.PATH_RESPONSE
         else:
             announce_context = RNS.Packet.NONE
 
-        RNS.Packet(self, announce_data, RNS.Packet.ANNOUNCE, context = announce_context).send()
+        announce_packet = RNS.Packet(self, announce_data, RNS.Packet.ANNOUNCE, context = announce_context, attached_interface = attached_interface)
 
+        if send:
+            announce_packet.send()
+        else:
+            return announce_packet
+
+    def accepts_links(self, accepts = None):
+        """
+        Set or query whether the destination accepts incoming link requests.
+
+        :param accepts: If ``True`` or ``False``, this method sets whether the destination accepts incoming link requests. If not provided or ``None``, the method returns whether the destination currently accepts link requests.
+        :returns: ``True`` or ``False`` depending on whether the destination accepts incoming link requests, if the *accepts* parameter is not provided or ``None``.
+        """
+        if accepts == None:
+            return self.accept_link_requests
+
+        if accepts:
+            self.accept_link_requests = True
+        else:
+            self.accept_link_requests = False
 
     def set_link_established_callback(self, callback):
         """
         Registers a function to be called when a link has been established to
         this destination.
 
-        :param callback: A function or method to be called.
+        :param callback: A function or method with the signature *callback(link)* to be called when a new link is established with this destination.
         """
         self.callbacks.link_established = callback
 
@@ -190,7 +265,7 @@ class Destination:
         Registers a function to be called when a packet has been received by
         this destination.
 
-        :param callback: A function or method to be called.
+        :param callback: A function or method with the signature *callback(data, packet)* to be called when this destination receives a packet.
         """
         self.callbacks.packet = callback
 
@@ -200,7 +275,7 @@ class Destination:
         a packet sent to this destination. Allows control over when and if
         proofs should be returned for received packets.
 
-        :param callback: A function or method to be called. The callback must return one of True or False. If the callback returns True, a proof will be sent. If it returns False, a proof will not be sent.
+        :param callback: A function or method to with the signature *callback(packet)* be called when a packet that requests a proof is received. The callback must return one of True or False. If the callback returns True, a proof will be sent. If it returns False, a proof will not be sent.
         """
         self.callbacks.proof_requested = callback
 
@@ -221,7 +296,7 @@ class Destination:
         Registers a request handler.
 
         :param path: The path for the request handler to be registered.
-        :param response_generator: A function or method with the signature *response_generator(path, data, request_id, remote_identity, requested_at)* to be called. Whatever this funcion returns will be sent as a response to the requester. If the function returns ``None``, no response will be sent.
+        :param response_generator: A function or method with the signature *response_generator(path, data, request_id, link_id, remote_identity, requested_at)* to be called. Whatever this funcion returns will be sent as a response to the requester. If the function returns ``None``, no response will be sent.
         :param allow: One of ``RNS.Destination.ALLOW_NONE``, ``RNS.Destination.ALLOW_ALL`` or ``RNS.Destination.ALLOW_LIST``. If ``RNS.Destination.ALLOW_LIST`` is set, the request handler will only respond to requests for identified peers in the supplied list.
         :param allowed_list: A list of *bytes-like* :ref:`RNS.Identity<api-identity>` hashes.
         :raises: ``ValueError`` if any of the supplied arguments are invalid.
@@ -270,9 +345,10 @@ class Destination:
 
 
     def incoming_link_request(self, data, packet):
-        link = RNS.Link.validate_request(self, data, packet)
-        if link != None:
-            self.links.append(link)
+        if self.accept_link_requests:
+            link = RNS.Link.validate_request(self, data, packet)
+            if link != None:
+                self.links.append(link)
 
     def create_keys(self):
         """
@@ -287,8 +363,8 @@ class Destination:
             raise TypeError("A single destination holds keys through an Identity instance")
 
         if self.type == Destination.GROUP:
-            self.prv_bytes = base64.urlsafe_b64decode(Fernet.generate_key())
-            self.prv = Fernet(base64.urlsafe_b64encode(self.prv_bytes))
+            self.prv_bytes = Fernet.generate_key()
+            self.prv = Fernet(self.prv_bytes)
 
 
     def get_private_key(self):
@@ -320,7 +396,7 @@ class Destination:
 
         if self.type == Destination.GROUP:
             self.prv_bytes = key
-            self.prv = Fernet(base64.urlsafe_b64encode(self.prv_bytes))
+            self.prv = Fernet(self.prv_bytes)
 
     def load_public_key(self, key):
         if self.type != Destination.SINGLE:
@@ -345,7 +421,7 @@ class Destination:
         if self.type == Destination.GROUP:
             if hasattr(self, "prv") and self.prv != None:
                 try:
-                    return base64.urlsafe_b64decode(self.prv.encrypt(plaintext))
+                    return self.prv.encrypt(plaintext)
                 except Exception as e:
                     RNS.log("The GROUP destination could not encrypt data", RNS.LOG_ERROR)
                     RNS.log("The contained exception was: "+str(e), RNS.LOG_ERROR)
@@ -370,7 +446,7 @@ class Destination:
         if self.type == Destination.GROUP:
             if hasattr(self, "prv") and self.prv != None:
                 try:
-                    return self.prv.decrypt(base64.urlsafe_b64encode(ciphertext))
+                    return self.prv.decrypt(ciphertext)
                 except Exception as e:
                     RNS.log("The GROUP destination could not decrypt data", RNS.LOG_ERROR)
                     RNS.log("The contained exception was: "+str(e), RNS.LOG_ERROR)

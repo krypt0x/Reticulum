@@ -5,21 +5,34 @@ This manual aims to provide you with all the information you need to
 understand Reticulum, build networks or develop programs using it, or
 to participate in the development of Reticulum itself.
 
+.. only:: html
+
+   Table Of Contents
+   =================
+
 .. toctree::
    :maxdepth: 3
 
    whatis
    gettingstartedfast
    using
-   networks
-   interfaces
    understanding
-   reference
+   hardware
+   interfaces
+   networks
    examples
+   support
+
+.. toctree::
+   :maxdepth: 2
+
+   reference
 
 
-Indices and Tables
-==================
+.. only:: html
 
-* :ref:`genindex`
-* :ref:`search`
+   Indices and Tables
+   ==================
+
+   * :ref:`genindex`
+   * :ref:`search`
